@@ -1,0 +1,40 @@
+# ── Never commit: proprietary vendor material or derivatives of it ──
+# Disassembly / decompilation output is a derivative work of a proprietary binary.
+*.asm
+full_disasm*
+decompiled/
+ghidra_proj/
+*.gpr
+*.rep/
+
+# Vendor SDK, device binaries, DSP skeletons
+*.so
+*.so.*
+lib*/
+2.4*/
+hexagon-v*/
+
+# Model artifacts (licensed separately, and large)
+*.bin
+*.dlc
+*.onnx
+*.pt2
+*.pte
+tokenizer*.json
+metadata.json
+
+# Raw profiling captures pulled from a device
+*.prof
+*.log
+qnn-profiling-data*
+
+# ── Build output ──
+/build/
+*.o
+*.out
+*_dbg
+
+# ── Environment ──
+.venv/
+__pycache__/
+*.pyc

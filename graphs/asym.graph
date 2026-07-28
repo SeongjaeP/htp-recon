@@ -1,0 +1,6 @@
+0	input	Input	IN		OUT	x
+1	bigA	Conv	IN	x	OUT	bigA_out
+2	smallB	Conv	IN	x	OUT	smallB_out
+3	useA	Relu	IN	bigA_out	OUT	useA_out
+4	useB	Relu	IN	smallB_out	OUT	useB_out
+5	merge	Add	IN	useA_out useB_out	OUT	merged

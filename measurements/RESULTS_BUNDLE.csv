@@ -1,0 +1,15 @@
+# On-device measurements: a publicly distributed, pre-built model bundle, run as-is.
+# Model: a 1B-parameter instruction-tuned LLM built for this SoC — 4-bit weights / 16-bit
+#        activations, weight sharing enabled, context length 4096. No recompilation.
+# Runner: the SDK's own net-run tool (2.43) against the device libraries shipped in the bundle.
+#
+# Each context holds two graphs (128-token prefill and 1-token decode); only the decode graph
+# (index 1) is executed here. Inputs are zero-filled — this measures latency, not accuracy.
+# latency_us = median of 3 rounds, 5 s duration each, burst performance profile.
+part,contains,ctx_bytes,latency_us,note
+part1_of_3.bin,embedding lookup,525398016,60,input_ids -> embedding
+part2_of_3.bin,decoder layers 0-7,256786432,7990,8 layers
+part3_of_3.bin,decoder layers 8-15 + output projection,523497472,15221,the 128256x2048 output projection dominates
+TOTAL,full 1B decode step,1305681920,23271,= 23.3 ms/token = 43 tok/s
+# Cross-check: this project's own w4a16 block measured 827 us; x8 layers = 6616 us against the
+# bundle's 7990 us for part 2, i.e. 17% under. Close enough to validate the per-block figure.

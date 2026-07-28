@@ -1,0 +1,15 @@
+input	8192
+output	8192
+a	8192
+ab	8192
+abc	8192
+b	8192
+c	8192
+convA_b	32
+convA_w	2304
+convB_b	32
+convB_w	2304
+convC_b	32
+convC_w	2304
+input_0231	8192
+output_0231	8192

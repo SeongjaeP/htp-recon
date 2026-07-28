@@ -1,0 +1,8 @@
+0	input_0231	Transpose	IN	input	OUT	input_0231
+1	convA	Conv2d	IN	input_0231 convA_w convA_b	OUT	a
+2	convB	Conv2d	IN	input_0231 convB_w convB_b	OUT	b
+3	convC	Conv2d	IN	input_0231 convC_w convC_b	OUT	c
+4	addAB	Eltwise_Binary	IN	a b	OUT	ab
+5	addABC	Eltwise_Binary	IN	ab c	OUT	abc
+6	relu	ElementWiseNeuron	IN	abc	OUT	output_0231
+7	output_0231	Transpose	IN	output_0231	OUT	output

@@ -1,0 +1,33 @@
+# On-device measurements: one real transformer decoder block, VTCM budget sweep.
+# Device: Snapdragon 8 Elite Gen 5 class SoC, v81 NPU architecture, burst performance profile,
+#         3 interleaved rounds.
+#
+# The block is layer 0 of a 1B-parameter instruction-tuned LLM, with its actual weights:
+#   hidden 2048 / 32 query heads / 8 KV heads / head_dim 64 / FFN 8192
+#   60,821,504 parameters per block; the full model is 16 of these.
+#
+# precision  fp16  = converted at 16-bit float                      (context 122 MB)
+#            w4a16 = 4-bit weights, 16-bit activations, 32-bit bias,
+#                    per-row quantisation                            (context 31 MB)
+# regime     prefill = 128 tokens at once / decode = 1 token with 128 cached
+#
+# latency_us_steady = round-median of the median after discarding 40 warm-up iterations
+# latency_us_cold   = median of the first 10 iterations
+# ratio_vs_8mb      = latency_us_steady relative to the 8 MB row of the same configuration
+precision,regime,seq,past,vtcm_mb,latency_us_steady,latency_us_cold,ratio_vs_8mb,nodes,spill_bytes,ctx_bytes
+fp16,prefill,128,0,1,197224,197224,35.78,7598,7405568,122355712
+fp16,prefill,128,0,2,13830,13895,2.51,6259,3012608,122327040
+fp16,prefill,128,0,4,5686,5670,1.03,5763,0,122200064
+fp16,prefill,128,0,8,5512,5510,1.00,6243,0,122220544
+fp16,decode,1,128,1,17232,17001,1.20,4071,425984,122023936
+fp16,decode,1,128,2,14939,6184,1.04,2663,0,121933824
+fp16,decode,1,128,4,14789,5364,1.03,2799,0,121913344
+fp16,decode,1,128,8,14402,4939,1.00,2799,0,121925632
+w4a16,prefill,128,0,1,3825,3944,3.88,4683,6684672,31334400
+w4a16,prefill,128,0,2,2324,2468,2.36,4605,4194304,31313920
+w4a16,prefill,128,0,4,1041,1042,1.06,3126,0,31166464
+w4a16,prefill,128,0,8,985,984,1.00,3111,0,31174656
+w4a16,decode,1,128,1,1417,1419,1.71,1979,397312,31035392
+w4a16,decode,1,128,2,1012,1015,1.22,1979,0,31035392
+w4a16,decode,1,128,4,863,865,1.04,2366,0,31051776
+w4a16,decode,1,128,8,827,830,1.00,2362,0,31051776

@@ -30,6 +30,8 @@ compiler's own output and against measurements on a physical device.
 | Channel splitting is driven by memory budget | On-device: tiles per layer as budget shrinks | 16 → 768 tiles, reproduced |
 | Dequantisation is `(q − offset) × scale` | Instruction-level reading, then checked against a shipping quantised LLM | **6 / 6 parameters**; the public header's `(q + offset)` fails 0 / 6 |
 | Resource-aware parallel scheduling | Slot count vs. sequential baseline | **60–67 % fewer slots** |
+| On-chip footprint decides when to split | Predicted split/no-split vs. vendor tile shapes, 4 graphs × 4 budgets | **16 / 16** |
+| …and which tile shape it picks | Same comparison, exact tile shape | **14 / 16** |
 
 The dequantisation result is the sharpest one: the **published header comments the sign
 backwards**, and a shipping model's own quantisation parameters settle it.
@@ -104,6 +106,7 @@ t5    | conv1   | relu0                | -        ← conv0/conv1 in separate sl
 src/
   minicc.c              the integrated mini compiler (stages ①–④)
   lowering.c            tile-count rule in isolation
+  vtcm_tiling.c         tile shape derived from an on-chip memory budget
   scheduler.c           topological (Kahn) scheduling, three tie-break policies
   scheduler_cbs.c       cost-based scheduling (memory-pressure greedy)
   scheduler_par.c       resource-aware parallel scheduling
@@ -150,6 +153,7 @@ Other entry points:
 
 ```sh
 ./build/lowering 128 64 32                          # tile count for one shape
+./build/vtcm_tiling                                 # tile shape vs. budget (-v to trace)
 ./build/scheduler graphs/branch_merge.graph 1       # tie-break policy 0..3
 ./build/scheduler_cbs graphs/asym.graph graphs/asym.sizes
 ./build/scheduler_par graphs/branch_merge.graph 4   # vector worker count
@@ -173,6 +177,7 @@ Other entry points:
 | [07-hardware-resources.md](docs/07-hardware-resources.md) | Engines, worker pools, DMA overlap, VTCM management |
 | [08-ondevice-measurements.md](docs/08-ondevice-measurements.md) | Latency sweeps and what they confirm |
 | [09-llm-case-study.md](docs/09-llm-case-study.md) | A shipping quantised LLM: KV cache, prefill/decode split |
+| [10-vtcm-footprint.md](docs/10-vtcm-footprint.md) | The byte accounting behind tile size; the third tiling axis |
 
 ## What is deliberately not modelled
 
@@ -188,3 +193,7 @@ Honest gaps, all observed but not implemented:
 - **Parallelism vs. memory trade-off.** More parallelism means more tensors alive at once,
   which increases memory pressure. The vendor runs its parallelisation stage *after*
   allocation for this reason; the two are not co-optimised here.
+- **How far the tile search goes.** The footprint condition (see
+  [docs/10](docs/10-vtcm-footprint.md)) correctly predicts *whether* a tile must be split, but
+  the vendor picks a smaller tile than the condition requires. The extra conservative margin —
+  double buffering is the likely cause — is not a single constant and is not modelled.

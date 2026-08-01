@@ -29,6 +29,9 @@ demo: all
 	@echo "=== tiling rule: tiles = ceil(H/8) ==="
 	@for h in 16 64 128 256; do ./$(BUILD)/lowering $$h 64 32; done
 	@echo
+	@echo "=== tile shape derived from an on-chip memory budget ==="
+	./$(BUILD)/vtcm_tiling
+	@echo
 	@echo "=== the integrated compiler, small enough to read ==="
 	./$(BUILD)/minicc 2097152 16 64 32
 	@echo

@@ -42,17 +42,44 @@ unconditional.
 
 ## Why 8
 
-The vendor's open-source MLIR backend for the same hardware family answers it. Its
-hardware-constant header defines the native tiled memory block:
+Three sources agree, and together they pin it down exactly.
+
+**The vendor's own layout documentation** defines the block as a *chunked memory layout*:
 
 ```
-INT8 block shape = {8, 8, 32}      →  8 × 8 × 32 × 1 byte  = 2048 B
-FP16 block shape = {8, 2, 32, 2}   →  8 × 2 × 32 × 2 × 2 B = 2048 B
+R4CroutonLayout = ChunkedMemoryLayout<4, 0,0, 1,0, 2,0, 3,0, 1,8, 2,8, 3,32>
+                                            ordering          chunk shape
 ```
 
-Both are exactly **2 KB**, and both have **8** as their first dimension. This block — the
-vendor calls it a *crouton* — is the unit the vector and matrix engines address. Tiles must
-land on block boundaries, so tile height is a multiple of 8 and tile channels a multiple of 32.
+Read the `(dimension, size)` pairs right to left: `3,32` takes 32 elements of the channel
+dimension, `2,8` takes 8 chunks along width, `1,8` takes 8 along height. So the chunk is
+**1 × 8 × 8 × 32** — and the documentation adds that anything smaller is *padded up* to it.
+
+**Its open-source MLIR backend** carries the same constants:
+
+```
+INT8_CROUTON_SHAPE = {8, 8, 32}
+F16_CROUTON_SHAPE  = {8, 2, 32, 2}
+```
+
+The 16-bit entry looks like it has an extra dimension, but the backend's own packing code
+multiplies entries `[1]` and `[3]` together to form the width — `2 × 2 = 4`. So the two shapes
+are really `8 × 8 × 32` and `8 × 4 × 32`:
+
+| | height | width | channels | element | total |
+|---|---|---|---|---|---|
+| INT8 | 8 | **8** | 32 | 1 B | **2048 B** |
+| FP16 | 8 | **4** | 32 | 2 B | **2048 B** |
+
+Both fill exactly **2 KB**. The element doubles in size, so the width halves — the block is a
+fixed *byte* size, not a fixed element count.
+
+**The design guide states the same fact a third way**, as a rounding rule: *"activation widths
+need to be rounded up to the nearest multiple of 8 (uint8) / 4 (uint16)"*, depths to 32, heights
+to 8. That rule is not a separate constraint — **it is the block shape**, restated.
+
+This block is what the vector and matrix engines address, so tiles land on its boundaries: height
+a multiple of 8, channels a multiple of 32, width a multiple of 8 or 4 by precision.
 
 The same open-source pass enforces it explicitly, rejecting any other tile size:
 
@@ -65,6 +92,20 @@ A useful corollary: **INT8 and FP16 occupy the same 2 KB block at different dens
 vs. 1024 elements). Quantisation's memory win is realised at the block level, and
 "quantisation" and "memory layout" are independent axes — which is why type names in the
 runtime combine both (an 8-bit *quantised* tensor in *crouton* layout is one named type).
+
+### Confirmed against measured tensors
+
+The tile shapes recorded in compiled graphs land on block boundaries exactly as predicted. An
+`(1, 8, 256, 128)` fp16 output tile is `1 × (8/8) × (256/4) × (128/32)` = **256 blocks**, i.e.
+`256 × 2 KB = 512 KB`, which matches its byte size exactly. The smallest observed tile,
+`(1, 8, 48, 32)`, is **12 blocks**.
+
+**Not everything is crouton-resident, though.** The halo input tile `(1, 10, 258, 128)` is a
+multiple of neither 8 nor 4, so it is not in block layout at all. Charging it crouton padding —
+rounding to `(1, 16, 260, 128)`, a 61 % increase — makes the footprint model *worse*
+(12/16 against 14/16, see [10-vtcm-footprint.md](10-vtcm-footprint.md)). The staging tile is
+**flat**, which the op inventory confirms: `flat_to_vtcm` and `flat_from_vtcm` exist alongside a
+separate `ForceFormat_Crouton`.
 
 ## Halo
 

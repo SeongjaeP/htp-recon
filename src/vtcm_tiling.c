@@ -44,8 +44,32 @@
 
 typedef struct { int h, w, oc; } Tile;
 
+// Width granularity of the 2 KB hardware block, which depends on element size.
+//
+// The vendor's layout documentation defines the block as a chunked layout of 1x8x8x32 for
+// 8-bit data. Its open-source backend carries the same constant as {8, 8, 32}, and the 16-bit
+// variant as {8, 2, 32, 2} -- whose first and last entries multiply together into the width,
+// giving 8 x 4 x 32. Both fill exactly 2048 bytes: the element doubles in size, so the width
+// halves.
+//
+// The design guide states the same fact a second way, as a rounding rule: "activation widths
+// need to be rounded up to the nearest multiple of 8 (uint8) / 4 (uint16)". That rule IS the
+// block width.
+static int crouton_w(int elsize) { return elsize == 1 ? 8 : 4; }
+
 // Resident bytes for one convolution tile: the input it reads (with halo), the slice of the
 // filter it needs, and the output it writes.
+//
+// Note on what is NOT padded here. Output tiles are crouton-resident and always land on block
+// boundaries already -- an (8, 256, 128) tile is exactly 256 blocks. The halo input tile does
+// not: (10, 258, 128) is a multiple of neither 8 nor 4. Padding it up to (16, 260, 128) was
+// tried, since that is what crouton residency would cost, and it made the predictions WORSE
+// (12/16 against 14/16) by shrinking tiles the vendor left whole.
+//
+// The reason is visible in the compiled graphs: the staging tile is flat, not crouton. The op
+// inventory carries flat_to_vtcm / flat_from_vtcm alongside a separate ForceFormat_Crouton, and
+// the recorded tensor dims are the unpadded (1, 10, 258, 128) rather than a padded shape. So
+// the halo tile is charged at its literal size.
 static long footprint(Tile t, int cin, int fh, int fw, int elsize) {
     long in  = (long)(t.h + fh - 1) * (t.w + fw - 1) * cin;   // halo: +2 for a 3x3 kernel
     long wt  = (long)fh * fw * cin * t.oc;                    // weights occupy TCM too
@@ -71,8 +95,8 @@ static Tile choose_tile(int H, int W, int cin, int oc, int fh, int fw,
             t.oc = floor_mult(t.oc / 2, TILE_OC);
             if (verbose) printf("      split oc -> %d  (footprint %ld)\n",
                                 t.oc, footprint(t, cin, fh, fw, ELSIZE));
-        } else if (t.w > TILE_H) {           // width rounds to a multiple of 8 as well
-            t.w = floor_mult(t.w / 2, TILE_H);
+        } else if (t.w > crouton_w(ELSIZE)) {   // width follows the block width for this dtype
+            t.w = floor_mult(t.w / 2, crouton_w(ELSIZE));
             if (verbose) printf("      split w  -> %d  (footprint %ld)\n",
                                 t.w, footprint(t, cin, fh, fw, ELSIZE));
         } else {

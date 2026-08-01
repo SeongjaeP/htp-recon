@@ -122,8 +122,18 @@ and per tile emit `SlicePad` (with halo) → `flat_from_vtcm` → `ConvLayer` �
 `Concat`. Predicted tile counts match the vendor compiler for H = 16, 64, 128, 256 and match
 counts measured on a device.
 
-**Not modelled:** the exact footprint arithmetic that decides *when* to split channels. The
-mechanism (halve, floor at 32, driven by budget) is established; the byte-level accounting is
-not, because a naive footprint estimate lands ~4–5× below the observed threshold — real
-accounting includes block padding, double-buffered staging, and working space this
-implementation does not track.
+## Two corrections, established later
+
+**There is a third tiling axis.** Under enough memory pressure the compiler splits **width** as
+well, also to a multiple of 8. The order is height → output channel → width. This is why the
+tightest budget produces 768 convolutions where height and channel alone predict 128:
+`32 height × 4 channel × 6 width`.
+
+**The footprint arithmetic is now modelled.** The estimate that landed ~4–5× low was missing
+three terms: weights occupy on-chip memory too, only half the budget is usable, and the halo
+multiplies the input term. The corrected condition reproduces the vendor's split/no-split
+decision 16/16 and its exact tile shape 14/16.
+
+Both are derived in [10-vtcm-footprint.md](10-vtcm-footprint.md), with `src/vtcm_tiling.c` as the
+implementation. What remains open there is *how far* the search goes once it decides to split —
+the condition is a valid bound but not a tight one.

@@ -169,6 +169,36 @@ That idle slot is the price of allocation, and it is exactly what the last line 
 the parallel pass *before* allocation would have reported 8 slots and an overlap that cannot
 actually happen.
 
+### Lowering is a rule table, not a function
+
+The vendor's compiler is a rule-driven rewriter. Its op packages declare rewrites as
+
+```c
+DEF_PACKAGE_OPTIMIZATION(EARLY,
+    Op("Relu", "X"),                                        // match
+    IS_QUANT_TYPE("X"),                                     // constraint
+    Op("ReluMinMax", "X", ConstScalar(0.0f), ConstScalar(INF)))   // replace
+```
+
+with priorities as pass groups (EARLY / MIDDLE / LATE) that run to a fixed point. That is where
+the shipped library's 31 MB of read-only data goes, and why one convolution comes back as
+nineteen ops — no single function emits them; a chain of rules does.
+
+`minicc` now has the same shape. It is handed one high-level `Conv2d` and rewrites it:
+
+```
+(1) Lowering by rules — 11 ops
+    pass   rule          matches     fired  why
+    EARLY  layout-in     Conv2d          1  engines address a tiled layout
+    MIDDLE tile-height   Conv2d          1  tile height is the 2 KB block height
+    MIDDLE stage-tile    ConvLayer       2  SlicePad -> flat_from_vtcm, +2 halo
+    LATE   activation    ConvLayer       2  kept separate so in-place can reclaim it
+```
+
+Every op in the output traces to the rule that produced it, and every rule records the evidence
+it rests on. Rules within a pass fire until nothing changes, so `tile-height` creating two
+`ConvLayer` nodes is what makes `stage-tile` fire twice.
+
 ### Turn the knobs
 
 Every decision the compiler makes is a command-line knob, and each one says whether it is fixed

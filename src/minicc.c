@@ -63,6 +63,11 @@ typedef struct {
   char outs[2][MAXNAME]; int nout;
   int indeg; int deps[MAXN]; int ndep; int scheduled; int depth;
   Resource res;                        // which engine this op runs on
+  int dead;                            // rewritten away; skipped when the graph is compacted
+  // Shape attributes the rules read, the way a vendor rule reads tensor dims and params.
+  int aH, aW, aOC, aCin, aEB;
+  int a_relu;                          // an activation follows this convolution
+  int a_staged;                        // its input already lives on chip
 } Node;
 static Node g[MAXN]; static int N=0;
 
@@ -128,6 +133,8 @@ typedef struct {
 } OpDef;
 
 static const OpDef OPS[] = {
+  { "Conv2d",         R_HMX, 100, F_NONE,
+    "the high-level op the framework hands over; rules rewrite it away before scheduling" },
   { "ConvLayer",      R_HMX, 100, F_NONE,
     "matrix engine: conv/matmul kernel family, and the device profiler tags it uses_hmx" },
   { "MatMul",         R_HMX, 100, F_NONE,
@@ -186,69 +193,172 @@ static void add_in(int nid,const char* t){
 }
 static void add_out(int nid,const char* t){ strncpy(g[nid].outs[g[nid].nout++],t,MAXNAME-1); }
 
-// ── Stage 1: lowering — one high-level Conv into a tiled low-level graph ──
-// The pattern reproduced here is the one the vendor compiler emits:
-//   InputSlice -> Transpose -> (SlicePad -> flat_from_vtcm -> ConvLayer) x tiles -> Concat
-static void lower_conv(const char* prefix, const char* graph_input,
-                       int H,int W,int OC,int Cin,int ebytes, char* final_out){
-  int tiles = (int)ceil_div(H, cfg.tile_h);
-  char nm[MAXNAME], t_in[MAXNAME], t_trans[MAXNAME];
+// ── Stage 1: lowering, as a rule table ────────────────────────────────────
+//
+// The vendor's compiler is a rule-driven graph rewriter, not a pile of hand-written expansion
+// code. Its op packages declare rewrites as
+//
+//     DEF_PACKAGE_OPTIMIZATION(PRIORITY, MATCH, CONSTRAINT, REPLACE)
+//
+// for example turning a quantised Relu into a ReluMinMax with fixed bounds. Priorities are pass
+// groups (EARLY, MIDDLE, LATE) and rules within a group fire until nothing changes. That is
+// where the 31 MB of read-only data in the shipped library goes, and why one convolution comes
+// back as nineteen ops: no single function emits them, a chain of rules does.
+//
+// The same shape is used here. Each rule carries the evidence it rests on, and every firing is
+// traceable, so "which rule produced this op" has an answer.
+enum { EARLY = 2000, MIDDLE = 3000, LATE = 4000 };
 
-  // InputSlice
-  snprintf(nm,sizeof nm,"%s_islice",prefix); int nIS=add_node(nm,"InputSlice");
-  add_in(nIS,graph_input);
-  snprintf(t_in,sizeof t_in,"%s_islice_out",prefix); add_out(nIS,t_in);
-  set_tensor(t_in, align_size((long)H*W*Cin*ebytes));
+typedef struct {
+  int         priority;
+  const char* name;
+  const char* match;                 // op type this rule looks for
+  int       (*constraint)(int n);    // when it applies
+  void      (*rewrite)(int n);       // what it does
+  const char* why;
+} Rule;
 
-  // Transpose into the layout the engines address (NHWC)
-  snprintf(nm,sizeof nm,"%s_transpose",prefix); int nTR=add_node(nm,"Transpose");
-  add_in(nTR,t_in);
-  snprintf(t_trans,sizeof t_trans,"%s_nhwc",prefix); add_out(nTR,t_trans);
-  set_tensor(t_trans, align_size((long)H*W*Cin*ebytes));
+static int rule_fired[16];           // per-rule firing counts, for the trace
 
-  // Per tile: SlicePad -> flat_from_vtcm -> ConvLayer -> Relu
-  static char tile_outs[MAXIN][MAXNAME]; // Concat's inputs, one per tile
-  if(tiles>MAXIN){ fprintf(stderr,"too many tiles\n"); exit(1); }
+static int  kill_node(int n){ g[n].dead = 1; return 1; }
+static void rewire_input(int n, const char* from, const char* to){
+  for(int k=0;k<g[n].nin;k++) if(!strcmp(g[n].ins[k], from)) strncpy(g[n].ins[k], to, MAXNAME-1);
+}
+
+// ── Rule 1 (EARLY): a convolution reading graph input needs the layout the engines address ──
+static int c_needs_layout(int n){ return !g[n].a_staged; }
+static void r_insert_layout(int n){
+  char nm[MAXNAME], t1[MAXNAME], t2[MAXNAME];
+  long bytes = align_size((long)g[n].aH * g[n].aW * g[n].aCin * g[n].aEB);
+  snprintf(nm,sizeof nm,"%s_islice",g[n].name);  int a=add_node(nm,"InputSlice");
+  add_in(a, g[n].ins[0]);
+  snprintf(t1,sizeof t1,"%s_islice_out",g[n].name); add_out(a,t1); set_tensor(t1,bytes);
+  snprintf(nm,sizeof nm,"%s_transpose",g[n].name); int b=add_node(nm,"Transpose");
+  add_in(b,t1);
+  snprintf(t2,sizeof t2,"%s_nhwc",g[n].name); add_out(b,t2); set_tensor(t2,bytes);
+  rewire_input(n, g[n].ins[0], t2);
+  g[n].a_staged = 1;
+}
+
+// ── Rule 2 (MIDDLE): split a convolution along height into hardware-block-tall tiles ──
+// Unconditional, because the block height is a layout property rather than a capacity one:
+// even an 8 KB convolution that fits any budget still comes back split.
+static int c_untiled(int n){ return g[n].aH > cfg.tile_h; }
+static void r_tile_height(int n){
+  int tiles = (int)ceil_div(g[n].aH, cfg.tile_h);
+  static char outs[MAXIN][MAXNAME];
+  char nm[MAXNAME];
   for(int t=0;t<tiles;t++){
-    int th = (t<tiles-1)? cfg.tile_h : (H-(tiles-1)*cfg.tile_h); // last tile may be short
-    long halo_in = align_size((long)(th+2)*(W+2)*Cin*ebytes); // +2 rows/cols = 3x3 kernel halo
-    long tile_out= align_size((long)th*W*OC*ebytes);
-
-    // SlicePad — cuts an overlapping slice; a plain slice would be one row short at each edge
-    snprintf(nm,sizeof nm,"%s_slicepad%d",prefix,t); int nSP=add_node(nm,"SlicePad");
-    add_in(nSP,t_trans);
-    char sp_out[MAXNAME]; snprintf(sp_out,sizeof sp_out,"%s_sp%d",prefix,t); add_out(nSP,sp_out);
-    set_tensor(sp_out, halo_in);
-
-    // flat_from_vtcm — stage the slice into on-chip memory
-    snprintf(nm,sizeof nm,"%s_vtcm%d",prefix,t); int nVT=add_node(nm,"flat_from_vtcm");
-    add_in(nVT,sp_out);
-    char vt_out[MAXNAME]; snprintf(vt_out,sizeof vt_out,"%s_vt%d",prefix,t); add_out(nVT,vt_out);
-    set_tensor(vt_out, halo_in);
-
-    // ConvLayer — compute this tile
-    snprintf(nm,sizeof nm,"%s_conv%d",prefix,t); int nCV=add_node(nm,"ConvLayer");
-    add_in(nCV,vt_out);
-    char cv_out[MAXNAME]; snprintf(cv_out,sizeof cv_out,"%s_c%d",prefix,t); add_out(nCV,cv_out);
-    set_tensor(cv_out, tile_out);
-
-    // Relu — real networks nearly always follow a conv with an activation.
-    // This op is the in-place candidate: elementwise, same size as its input, and the only
-    // consumer of the conv output.
-    // (The real hardware instead fuses relu into the matrix engine's output stage. Keeping it
-    //  separate and recovering the memory via in-place reuse is a different trade-off.)
-    snprintf(nm,sizeof nm,"%s_relu%d",prefix,t); int nRL=add_node(nm,"Relu");
-    add_in(nRL,cv_out);
-    char rl_out[MAXNAME]; snprintf(rl_out,sizeof rl_out,"%s_r%d",prefix,t); add_out(nRL,rl_out);
-    set_tensor(rl_out, tile_out);            // same size as the conv output -> in-place condition 2
-    strncpy(tile_outs[t],rl_out,MAXNAME-1);  // Concat consumes the relu outputs
+    int th = (t<tiles-1) ? cfg.tile_h : (g[n].aH - (tiles-1)*cfg.tile_h);
+    snprintf(nm,sizeof nm,"%s_conv%d",g[n].name,t); int c=add_node(nm,"ConvLayer");
+    add_in(c, g[n].ins[0]);
+    g[c].aH=th; g[c].aW=g[n].aW; g[c].aOC=g[n].aOC; g[c].aCin=g[n].aCin; g[c].aEB=g[n].aEB;
+    g[c].a_relu=g[n].a_relu; g[c].a_staged=0;
+    snprintf(outs[t],MAXNAME,"%s_c%d",g[n].name,t); add_out(c,outs[t]);
+    set_tensor(outs[t], align_size((long)th*g[n].aW*g[n].aOC*g[n].aEB));
   }
+  snprintf(nm,sizeof nm,"%s_concat",g[n].name); int cc=add_node(nm,"Concat");
+  for(int t=0;t<tiles;t++) add_in(cc,outs[t]);
+  add_out(cc, g[n].outs[0]);
+  kill_node(n);
+}
 
-  // Concat — reassemble the tiles
-  snprintf(nm,sizeof nm,"%s_concat",prefix); int nCC=add_node(nm,"Concat");
-  for(int t=0;t<tiles;t++) add_in(nCC,tile_outs[t]);
-  snprintf(final_out,MAXNAME,"%s_out",prefix); add_out(nCC,final_out);
-  set_tensor(final_out, align_size((long)H*W*OC*ebytes));
+// ── Rule 3 (MIDDLE): a tile convolution must have its input staged on chip ──
+// The halo is why a plain slice will not do: producing 8 output rows reads 8 + (kernel-1).
+static int c_unstaged_tile(int n){ return !g[n].a_staged; }
+static void r_stage_tile(int n){
+  char nm[MAXNAME], sp[MAXNAME], vt[MAXNAME];
+  long halo = align_size((long)(g[n].aH+2) * (g[n].aW+2) * g[n].aCin * g[n].aEB);
+  snprintf(nm,sizeof nm,"%s_sp",g[n].name);   int a=add_node(nm,"SlicePad");
+  add_in(a, g[n].ins[0]);
+  snprintf(sp,sizeof sp,"%s_spo",g[n].name);  add_out(a,sp); set_tensor(sp,halo);
+  snprintf(nm,sizeof nm,"%s_vtcm",g[n].name); int b=add_node(nm,"flat_from_vtcm");
+  add_in(b,sp);
+  snprintf(vt,sizeof vt,"%s_vt",g[n].name);   add_out(b,vt); set_tensor(vt,halo);
+  rewire_input(n, g[n].ins[0], vt);
+  g[n].a_staged = 1;
+}
+
+// ── Rule 4 (LATE): give the activation its own op ──
+// The real hardware fuses relu into the matrix engine's output stage instead. Keeping it
+// separate is this implementation's choice: the memory is recovered by in-place reuse rather
+// than by fusion, which is why Relu carries F_DESTRUCTIVE in the op registry.
+static int c_has_activation(int n){ return g[n].a_relu; }
+static void r_split_activation(int n){
+  char nm[MAXNAME], ro[MAXNAME];
+  snprintf(nm,sizeof nm,"%s_relu",g[n].name); int r=add_node(nm,"Relu");
+  add_in(r, g[n].outs[0]);
+  snprintf(ro,sizeof ro,"%s_r",g[n].name); add_out(r,ro);
+  set_tensor(ro, size_of(g[n].outs[0]));
+  for(int i=0;i<N;i++){                       // consumers of the conv output now read the relu
+    if(i==r || g[i].dead) continue;
+    for(int k=0;k<g[i].nin;k++)
+      if(!strcmp(g[i].ins[k], g[n].outs[0])) strncpy(g[i].ins[k], ro, MAXNAME-1);
+  }
+  g[n].a_relu = 0;
+}
+
+static const Rule RULES[] = {
+ { EARLY,  "layout-in",  "Conv2d",    c_needs_layout,    r_insert_layout,
+   "the engines address a tiled layout; observed InputSlice -> Transpose ahead of every conv" },
+ { MIDDLE, "tile-height","Conv2d",    c_untiled,         r_tile_height,
+   "tile height is the 2 KB block height and applies unconditionally (docs/03)" },
+ { MIDDLE, "stage-tile", "ConvLayer", c_unstaged_tile,   r_stage_tile,
+   "observed SlicePad -> flat_from_vtcm before each tile conv; +2 rows/cols of halo" },
+ { LATE,   "activation", "ConvLayer", c_has_activation,  r_split_activation,
+   "kept separate rather than fused, so in-place reuse can reclaim the memory" },
+ { 0, NULL, NULL, NULL, NULL, NULL }
+};
+#define NRULES ((int)(sizeof(RULES)/sizeof(RULES[0])) - 1)
+
+// Fire every rule of one priority until nothing changes — the fixed point the vendor's pass
+// groups also run to.
+static int run_pass(int priority){
+  int total=0, rounds=0;
+  for(;;){
+    int changed=0;
+    int limit=N;                                  // rules append; do not rescan what they add
+    for(int i=0;i<limit;i++){
+      if(g[i].dead) continue;
+      for(int r=0;r<NRULES;r++){
+        if(RULES[r].priority!=priority) continue;
+        if(strcmp(g[i].type, RULES[r].match)) continue;
+        if(RULES[r].constraint && !RULES[r].constraint(i)) continue;
+        RULES[r].rewrite(i);
+        rule_fired[r]++; total++; changed=1;
+        if(g[i].dead) break;
+      }
+    }
+    if(!changed || ++rounds>32) break;
+  }
+  return total;
+}
+
+// Drop rewritten nodes and renumber.
+static void compact(void){
+  int map[MAXN], m=0;
+  for(int i=0;i<N;i++){ map[i] = g[i].dead ? -1 : m; if(!g[i].dead) g[m++]=g[i]; }
+  (void)map; N=m;
+  for(int i=0;i<N;i++) g[i].id=i;
+}
+
+// The input graph: one high-level convolution, the way a framework would hand it over.
+static void seed_conv(const char* name, const char* in, const char* out,
+                      int H,int W,int OC,int Cin,int eb,int relu){
+  int n=add_node(name,"Conv2d");
+  add_in(n,in); add_out(n,out);
+  g[n].aH=H; g[n].aW=W; g[n].aOC=OC; g[n].aCin=Cin; g[n].aEB=eb; g[n].a_relu=relu;
+  set_tensor(out, align_size((long)H*W*OC*eb));
+}
+
+static void dump_rules(void){
+  printf("\n(1) Lowering by rules — %d ops\n", N);
+  printf("    %-6s %-13s %-11s %5s  %s\n","pass","rule","matches","fired","why");
+  printf("    %s\n","------------------------------------------------------------------------");
+  for(int r=0;r<NRULES;r++)
+    printf("    %-6s %-13s %-11s %5d  %s\n",
+      RULES[r].priority==EARLY?"EARLY":RULES[r].priority==MIDDLE?"MIDDLE":"LATE",
+      RULES[r].name, RULES[r].match, rule_fired[r], RULES[r].why);
 }
 
 // ── DAG construction ──
@@ -511,12 +621,14 @@ int main(int argc,char**argv){
   if (CAP[R_HVX] > MAXCAP) CAP[R_HVX] = MAXCAP;
   long vtcm = cfg.vtcm; int H = cfg.H, W = cfg.W, OC = cfg.oc;
 
-  // Stage 1 — lowering
-  char fout[MAXNAME];
+  // Stage 1 — lowering, by rules
   set_tensor("graph_input", align_size((long)H*W*OC*2));
-  lower_conv("cv", "graph_input", H,W,OC,/*Cin*/OC,/*ebytes*/2, fout);
-  printf("(1) Lowering: 1 high-level Conv -> %d low-level ops (tiles = ceil(%d/8) = %ld)\n",
-         N, H, ceil_div(H,cfg.tile_h));
+  seed_conv("cv", "graph_input", "cv_out", H, W, OC, /*Cin*/OC, /*ebytes*/2, /*relu*/1);
+  run_pass(EARLY);
+  run_pass(MIDDLE);
+  run_pass(LATE);
+  compact();
+  dump_rules();
   for(int i=0;i<N;i++) printf("    %-16s %s\n", g[i].name, g[i].type);
 
   // Stage 2 — pre-schedule. A sequential order is what allocation will see, and it is what

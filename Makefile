@@ -32,8 +32,11 @@ demo: all
 	@echo "=== tile shape derived from an on-chip memory budget ==="
 	./$(BUILD)/vtcm_tiling
 	@echo
+	@echo "=== op registry: engine, cost, flags, and the evidence for each ==="
+	./$(BUILD)/minicc --ops
+	@echo
 	@echo "=== the integrated compiler, small enough to read ==="
-	./$(BUILD)/minicc 2097152 16 64 32
+	./$(BUILD)/minicc H=16 W=64 oc=32 vtcm=2097152
 	@echo
 	@echo "=== scheduling: the same graph under two tie-break policies ==="
 	./$(BUILD)/scheduler graphs/branch_merge.graph 0 | tail -12

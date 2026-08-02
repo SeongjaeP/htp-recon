@@ -136,8 +136,8 @@ make          # builds everything into ./build; C99, no dependencies beyond libm
 make demo     # runs every tool and prints every result in one pass
 ```
 
-Sample output — `./build/minicc 2097152 16 64 32` (vtcm_bytes, H, W, out_channels), with
-`H=16` chosen because two tiles is small enough to read in full:
+Sample output — `./build/minicc H=16 W=64 oc=32 vtcm=2097152`, with `H=16` chosen because two
+tiles is small enough to read in full:
 
 ```
 (1) Lowering: 1 high-level Conv -> 11 low-level ops (tiles = ceil(16/8) = 2)
@@ -168,6 +168,49 @@ bytes tile 0 is still using would corrupt it. That load only happens at `t5`.
 That idle slot is the price of allocation, and it is exactly what the last line counts. Running
 the parallel pass *before* allocation would have reported 8 slots and an overlap that cannot
 actually happen.
+
+### Turn the knobs
+
+Every decision the compiler makes is a command-line knob, and each one says whether it is fixed
+by hardware or is a policy choice this implementation is free to make differently.
+
+```sh
+./build/minicc --ops                      # the op registry: engine, cost, flags, and the
+                                          # evidence each entry rests on
+./build/minicc H=64 vtcm=8388608 hvx=8    # anything can be overridden
+```
+
+Sweeping them on one convolution (H=64, 8 MB budget):
+
+| setting | ops | slots | peak | what it shows |
+|---|---|---|---|---|
+| *(default)* | 35 | 27 | 554 KB | |
+| `tile_h=16` | 19 | 15 | 588 KB | fewer, larger tiles — **more** memory, and off the block height |
+| `tile_h=4` | 67 | 51 | 538 KB | finer tiles pay in op count and halo overhead |
+| `hvx=1` | 35 | 33 | 554 KB | the vector engine becomes the bottleneck |
+| `hvx=8` | 35 | 27 | 554 KB | …but 4 was already enough; something else binds |
+| `hmx=4` | 35 | 27 | 554 KB | **more matrix engines than exist changes nothing** |
+| `prefetch=2` | 35 | 20 | 606 KB | double buffering: 26 % fewer slots for 9 % more memory |
+| `inplace=0` | 35 | 27 | 596 KB | destructive reuse was saving 42 KB |
+| `align=256` | 35 | 27 | 553 KB | the vendor's finer alignment barely matters at this size |
+| `antidep=0` | 35 | 14 | 554 KB | ignoring allocation looks twice as fast, **and is wrong** |
+
+Two rows are worth dwelling on. `hmx=4` gives a compiler four matrix engines the silicon does
+not have, and the schedule does not improve — the binding constraint is data and allocation
+ordering, not engine count. And `antidep=0` is the number a scheduler reports when it ignores
+where the allocator put things: 14 slots instead of 27. It is not achievable; it is what the
+earlier "60–67 % fewer slots" claim was measuring.
+
+Each run ends with a table of what was decided, its source, and its cost:
+
+```
+knob      value     source                     consequence here
+tile_h    8         hardware block height      8 conv tiles
+hmx       1         hardware limit             convolutions are serial
+vtcm      8192      graph config option        peak 606 KB, spill 0 KB
+prefetch  2         df_dma_prefetch_distance   78 anti-deps, +6 slots
+antidep   1         required for correctness   schedule respects allocation
+```
 
 Other entry points:
 

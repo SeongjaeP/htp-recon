@@ -25,9 +25,21 @@
 #define MAXN 1024
 #define MAXNAME 96
 #define MAXTEN 8192
-#define TILE_H 8      // crouton height: the hardware's 2 KB block is 8 rows tall
-#define ALIGN_LARGE 2048
-#define ALIGN_SMALL 128
+// ── Every decision this compiler makes, in one place ──
+// Each field is a knob. The `src` column in the report at the end of a run says where the value
+// comes from: a hardware limit that must not be changed, a figure from the vendor's own
+// documentation, or a policy choice this implementation is free to make differently.
+typedef struct {
+  long vtcm;        // on-chip budget, bytes
+  int  H, W, oc;    // problem shape
+  int  tile_h;      // height tile — 8 is the hardware block height
+  int  hmx, hvx, dma;   // workers per engine — HMX is 1 in hardware
+  int  prefetch;    // double-buffer distance, in schedule steps
+  int  align_big, align_small;  // allocator alignment
+  int  inplace;     // allow destructive reuse
+  int  antidep;     // honour the constraints allocation creates
+} Config;
+static Config cfg = { 2L*1024*1024, 64, 64, 32, 8, 1, 4, 1, 0, 2048, 128, 1, 1 };
 
 // ── Resource model ──
 // Taken from the device-side execution kernel's diagnostic strings:
@@ -83,7 +95,7 @@ static void add_anti(int u, int v) {
 }
 
 static long ceil_div(long a,long b){ return (a+b-1)/b; }
-static long align_size(long n){ long a=(n>=ALIGN_LARGE)?ALIGN_LARGE:ALIGN_SMALL; return (n+a-1)&~(a-1); }
+static long align_size(long n){ long a=(n>=cfg.align_big)?cfg.align_big:cfg.align_small; return (n+a-1)&~(a-1); }
 
 static void set_tensor(const char* nm,long bytes){
   for(int i=0;i<NT;i++) if(strcmp(ten[i].name,nm)==0){ ten[i].size=bytes; return; }
@@ -94,19 +106,72 @@ static long size_of(const char* nm){
   return 0;
 }
 
-// op type -> engine. Matched exactly, not by substring: depthwise convolution runs on the
-// vector engine, so a substring test for "Conv" would misfile it onto the matrix engine.
-static Resource resource_of(const char* type) {
-  if(strcmp(type, "ConvLayer")==0) return R_HMX;
-  if(strcmp(type, "MatMul")==0) return R_HMX;
-  if(strcmp(type, "Transpose")==0) return R_HVX;
-  if(strcmp(type, "EltwiseAdd")==0) return R_HVX;
-  if(strcmp(type, "Relu")==0) return R_HVX;
-  if(strcmp(type, "SlicePad")==0) return R_HVX;
-  if(strcmp(type, "InputSlice")==0) return R_DMA;
-  if(strcmp(type, "flat_from_vtcm")==0) return R_DMA;
-  if(strcmp(type, "Concat")==0) return R_DMA;
-  fprintf(stderr,"unknown op type: %s\n",type); exit(1);
+// ── Op registry ──────────────────────────────────────────────────────────
+// Everything the compiler needs to know about an op, as data rather than as branches in code.
+//
+// This mirrors how the vendor does it. Its op packages register each op with its cost and the
+// resources it uses — DEF_PACKAGE_OP_AND_COST_AND_FLAGS(impl, "Relu", SNAIL,
+// Flags::RESOURCE_HVX) — so engine assignment and cost are table entries, not if-chains. The
+// `why` column is this project's addition: every row records the evidence it rests on, so a
+// wrong entry is traceable rather than mysterious.
+//
+// cost is a relative weight, not cycles. It is not used for scheduling yet (a slot is a logical
+// step, not a duration); it is here so that weighting is a table edit when it arrives.
+typedef enum { F_NONE = 0, F_DESTRUCTIVE = 1u << 0, F_STAGING = 1u << 1 } OpFlags;
+
+typedef struct {
+  const char* name;
+  Resource    res;
+  int         cost;
+  unsigned    flags;
+  const char* why;
+} OpDef;
+
+static const OpDef OPS[] = {
+  { "ConvLayer",      R_HMX, 100, F_NONE,
+    "matrix engine: conv/matmul kernel family, and the device profiler tags it uses_hmx" },
+  { "MatMul",         R_HMX, 100, F_NONE,
+    "same family; note a shipping LLM compiles its Linear layers to ConvLayer, not MatMul" },
+  { "Transpose",      R_HVX,   4, F_NONE,
+    "layout conversion runs on the vector engine" },
+  { "EltwiseAdd",     R_HVX,   1, F_DESTRUCTIVE,
+    "elementwise: y[i] = f(x[i], y[i]), so the read and write indices coincide" },
+  { "Relu",           R_HVX,   1, F_DESTRUCTIVE,
+    "elementwise; the real hardware fuses it into the conv output stage instead" },
+  { "SlicePad",       R_HVX,   2, F_NONE,
+    "cuts an overlapping slice; not destructive because read and write positions differ" },
+  { "InputSlice",     R_DMA,   8, F_STAGING,
+    "data movement" },
+  { "flat_from_vtcm", R_DMA,  10, F_STAGING,
+    "stages a tile into on-chip memory; the pipelined buffer, so double buffering targets it" },
+  { "Concat",         R_DMA,   6, F_NONE,
+    "reassembles tiles; movement, not compute" },
+};
+#define NOPS ((int)(sizeof(OPS)/sizeof(OPS[0])))
+
+// Exact match, never substring: depthwise convolution runs on the VECTOR engine, so a substring
+// test for "Conv" would misfile it onto the matrix engine.
+static const OpDef* op_def(const char* type) {
+  for (int i = 0; i < NOPS; i++) if (strcmp(OPS[i].name, type) == 0) return &OPS[i];
+  fprintf(stderr, "unknown op type: %s  (add it to OPS[])\n", type); exit(1);
+}
+static Resource resource_of(const char* type)      { return op_def(type)->res; }
+static int is_destructive_op(const char* type)     { return (op_def(type)->flags & F_DESTRUCTIVE) != 0; }
+static int is_staging_op(const char* type)         { return (op_def(type)->flags & F_STAGING) != 0; }
+
+static void dump_ops(void) {
+  printf("op registry — every engine/cost/flag decision, and what it rests on\n\n");
+  printf("  %-16s %-5s %5s  %-12s %s\n", "op", "res", "cost", "flags", "why");
+  printf("  %s\n", "---------------------------------------------------------------------------");
+  for (int i = 0; i < NOPS; i++) {
+    char f[24] = "-";
+    if (OPS[i].flags) { f[0]=0;
+      if (OPS[i].flags & F_DESTRUCTIVE) strcat(f, "destructive ");
+      if (OPS[i].flags & F_STAGING)     strcat(f, "staging");
+    }
+    printf("  %-16s %-5s %5d  %-12s %s\n",
+           OPS[i].name, RNAME[OPS[i].res], OPS[i].cost, f, OPS[i].why);
+  }
 }
 
 static int add_node(const char* name,const char* type){
@@ -126,7 +191,7 @@ static void add_out(int nid,const char* t){ strncpy(g[nid].outs[g[nid].nout++],t
 //   InputSlice -> Transpose -> (SlicePad -> flat_from_vtcm -> ConvLayer) x tiles -> Concat
 static void lower_conv(const char* prefix, const char* graph_input,
                        int H,int W,int OC,int Cin,int ebytes, char* final_out){
-  int tiles = (int)ceil_div(H, TILE_H);
+  int tiles = (int)ceil_div(H, cfg.tile_h);
   char nm[MAXNAME], t_in[MAXNAME], t_trans[MAXNAME];
 
   // InputSlice
@@ -145,7 +210,7 @@ static void lower_conv(const char* prefix, const char* graph_input,
   static char tile_outs[MAXIN][MAXNAME]; // Concat's inputs, one per tile
   if(tiles>MAXIN){ fprintf(stderr,"too many tiles\n"); exit(1); }
   for(int t=0;t<tiles;t++){
-    int th = (t<tiles-1)? TILE_H : (H-(tiles-1)*TILE_H); // last tile may be a short remainder
+    int th = (t<tiles-1)? cfg.tile_h : (H-(tiles-1)*cfg.tile_h); // last tile may be short
     long halo_in = align_size((long)(th+2)*(W+2)*Cin*ebytes); // +2 rows/cols = 3x3 kernel halo
     long tile_out= align_size((long)th*W*OC*ebytes);
 
@@ -228,7 +293,7 @@ static void schedule_par(int slot[][R_NUM][MAXCAP], int* nslots, int* rl, int* r
   // Real data dependencies plus whatever ordering the allocator imposed. With n_anti == 0 this
   // is the ordinary parallel schedule; after allocation it is the constrained one.
   for (int i = 0; i < N; i++) { indeg[i] = g[i].indeg; g[i].scheduled = 0; }
-  for (int k = 0; k < n_anti; k++) indeg[anti_v[k]]++;
+  if (cfg.antidep) for (int k = 0; k < n_anti; k++) indeg[anti_v[k]]++;
   *rn = 0;
   int t = 0;
   for (;; t++) {
@@ -261,7 +326,7 @@ static void schedule_par(int slot[][R_NUM][MAXCAP], int* nslots, int* rl, int* r
       int b = picked[r][k];
       for (int i = 0; i < N; i++) for (int d = 0; d < g[i].ndep; d++)
         if (g[i].deps[d] == b) indeg[i]--;
-      for (int e = 0; e < n_anti; e++) if (anti_u[e] == b) indeg[anti_v[e]]--;
+      if (cfg.antidep) for (int e = 0; e < n_anti; e++) if (anti_u[e]==b) indeg[anti_v[e]]--;
     }
   }
   *nslots = t;
@@ -273,24 +338,12 @@ static void schedule_par(int slot[][R_NUM][MAXCAP], int* nslots, int* rl, int* r
 // must use that one, or padding a lifetime would push its constraint later and tighten it.
 typedef struct{char name[MAXNAME];long size;int birth,death,last_use;long offset;
                int alias_of;} Live;   // alias_of = tensor sharing this address (-1 = independent)
-static Live L[MAXTEN]; static int nL=0;
+static Live L[MAXTEN]; static int nL=0; static int nlinked_report=0;
 // The entire safety condition for sharing an address: lifetimes must not overlap.
 static int overlaps(int a,int b){ return !(L[a].death<L[b].birth||L[b].death<L[a].birth); }
 static int find_live(const char* nm){                  // tensor name -> index into L[]
   for(int i=0;i<nL;i++) if(strcmp(L[i].name,nm)==0) return i;
   return -1;
-}
-
-// Which ops may write their result over their own input?
-// Only ops of the form y[i] = f(x[i]) — read index equals write index.
-//   Convolution:  no. One output reads several inputs, so overwriting destroys data a later
-//                 output still needs.
-//   Transpose:    no, and for a subtler reason. It is one-to-one, but read and write positions
-//                 differ, so writing y[1] can clobber an x[1] that y[2] still needs.
-static int is_destructive_op(const char* type) {
-  if(strcmp(type, "Relu")==0) return 1;
-  if(strcmp(type, "EltwiseAdd")==0) return 1;
-  return 0;
 }
 
 // Link outputs onto inputs where destructive reuse is legal. Run BEFORE allocation, matching
@@ -324,8 +377,6 @@ static int link_inplace(int* pos) {
 // That is double buffering, expressed as an allocator policy rather than a scheduler one. The
 // runtime exposes the same idea as df_dma_prefetch_distance: issue the load N steps ahead, which
 // is only safe if N+1 buffers exist to hold the results.
-static int PREFETCH = 0;
-
 static void alloc_vtcm(int* rl,int rn,long vtcm,long* peak_o,long* spill_o){
   int pos[MAXN]; for(int s=0;s<rn;s++) pos[rl[s]]=s;
   nL=0;
@@ -338,7 +389,7 @@ static void alloc_vtcm(int* rl,int rn,long vtcm,long* peak_o,long* spill_o){
     L[nL].last_use=death; L[nL].offset=-1; L[nL].alias_of=-1; nL++;
   }
 
-  int nlinked = link_inplace(pos);
+  int nlinked = cfg.inplace ? link_inplace(pos) : 0; nlinked_report = nlinked;
   if(nlinked) printf("   [in-place links: %d]\n", nlinked);
 
   // Double buffering: hold the DMA-staged tensors past their last read, so the next tile's
@@ -348,14 +399,14 @@ static void alloc_vtcm(int* rl,int rn,long vtcm,long* peak_o,long* spill_o){
   // extending everything costs peak memory across the whole graph and buys nothing for the
   // compute/transfer overlap. Applied AFTER in-place linking, which needs the exact last-use
   // step to decide whether overwriting is legal.
-  if(PREFETCH > 0)
+  if(cfg.prefetch > 0)
     for(int i=0;i<nL;i++){
       int prod = -1;
       for(int j=0;j<N && prod<0;j++)
         for(int k=0;k<g[j].nout;k++)
           if(strcmp(g[j].outs[k], L[i].name)==0){ prod=j; break; }
-      if(prod < 0 || g[prod].res != R_DMA) continue;   // staged buffers only
-      L[i].death += PREFETCH;
+      if(prod < 0 || !is_staging_op(g[prod].type)) continue;   // staged buffers only
+      L[i].death += cfg.prefetch;
       if(L[i].death > rn-1) L[i].death = rn-1;
     }
 
@@ -423,22 +474,49 @@ static int record_anti_deps(int* rl, int rn) {
   return n_anti;
 }
 
-int main(int argc,char**argv){
-  long vtcm = (argc>1)? atol(argv[1]) : (2L*1024*1024);
-  int H = (argc>2)? atoi(argv[2]) : 64;
-  int W = (argc>3)? atoi(argv[3]) : 64;
-  int OC= (argc>4)? atoi(argv[4]) : 32;
-  PREFETCH = (argc>5)? atoi(argv[5]) : 0;   // 0 = pack tightly, 1 = double buffer
+static void usage(const char* p) {
+  printf("usage: %s [key=value ...] [--ops]\n\n", p);
+  printf("  shape     H=64 W=64 oc=32            the convolution to compile\n");
+  printf("  budget    vtcm=2097152               on-chip bytes\n");
+  printf("  tiling    tile_h=8                   height tile (8 = hardware block height)\n");
+  printf("  engines   hmx=1 hvx=4 dma=1          workers per engine (hmx is 1 in hardware)\n");
+  printf("  memory    prefetch=0 align=2048      double-buffer distance, allocator alignment\n");
+  printf("  policy    inplace=1 antidep=1        destructive reuse; honour allocator ordering\n\n");
+  printf("  --ops     print the op registry\n");
+}
 
-  printf("========= mini HTP compiler =========\n");
-  printf("input high-level graph: Conv [1,%d,%d,%d] (Cin=%d), fp16\n\n", H,W,OC,OC);
+int main(int argc,char**argv){
+  // key=value on the command line; everything is a knob, nothing is buried.
+  for (int a = 1; a < argc; a++) {
+    if (strcmp(argv[a], "--ops") == 0)   { dump_ops(); return 0; }
+    if (strcmp(argv[a], "--help") == 0)  { usage(argv[0]); return 0; }
+    char* eq = strchr(argv[a], '=');
+    if (!eq) { fprintf(stderr, "expected key=value, got '%s'\n", argv[a]); usage(argv[0]); return 2; }
+    *eq = 0; const char* k = argv[a]; long v = atol(eq+1);
+    if      (!strcmp(k,"vtcm"))     cfg.vtcm = v;
+    else if (!strcmp(k,"H"))        cfg.H = v;
+    else if (!strcmp(k,"W"))        cfg.W = v;
+    else if (!strcmp(k,"oc"))       cfg.oc = v;
+    else if (!strcmp(k,"tile_h"))   cfg.tile_h = v;
+    else if (!strcmp(k,"hmx"))      cfg.hmx = v;
+    else if (!strcmp(k,"hvx"))      cfg.hvx = v;
+    else if (!strcmp(k,"dma"))      cfg.dma = v;
+    else if (!strcmp(k,"prefetch")) cfg.prefetch = v;
+    else if (!strcmp(k,"align"))    cfg.align_big = v;
+    else if (!strcmp(k,"inplace"))  cfg.inplace = v;
+    else if (!strcmp(k,"antidep"))  cfg.antidep = v;
+    else { fprintf(stderr, "unknown knob '%s'\n", k); usage(argv[0]); return 2; }
+  }
+  CAP[R_HMX]=cfg.hmx; CAP[R_HVX]=cfg.hvx; CAP[R_DMA]=cfg.dma;
+  if (CAP[R_HVX] > MAXCAP) CAP[R_HVX] = MAXCAP;
+  long vtcm = cfg.vtcm; int H = cfg.H, W = cfg.W, OC = cfg.oc;
 
   // Stage 1 — lowering
   char fout[MAXNAME];
   set_tensor("graph_input", align_size((long)H*W*OC*2));
   lower_conv("cv", "graph_input", H,W,OC,/*Cin*/OC,/*ebytes*/2, fout);
   printf("(1) Lowering: 1 high-level Conv -> %d low-level ops (tiles = ceil(%d/8) = %ld)\n",
-         N, H, ceil_div(H,TILE_H));
+         N, H, ceil_div(H,cfg.tile_h));
   for(int i=0;i<N;i++) printf("    %-16s %s\n", g[i].name, g[i].type);
 
   // Stage 2 — pre-schedule. A sequential order is what allocation will see, and it is what
@@ -500,5 +578,30 @@ int main(int argc,char**argv){
          "   <- %d slots given back to allocation\n",
          nslots, 100.0*(N-nslots)/N, nslots-nfree);
 
+  // ── What was decided, where it came from, and what it cost here ──
+  // The point of this table is that nothing is buried. Every number above is the consequence
+  // of a knob, each knob says whether it is fixed by hardware or is a policy choice, and any
+  // value that departs from the hardware is called out as such.
+  printf("\n===== decisions =====\n");
+  printf("  %-9s %-9s %-26s %s\n", "knob", "value", "source", "consequence here");
+  printf("  %s\n", "-------------------------------------------------------------------------");
+  printf("  %-9s %-9d %-26s %ld conv tiles\n", "tile_h", cfg.tile_h,
+         cfg.tile_h==8 ? "hardware block height" : "POLICY (not the hardware)",
+         ceil_div(H, cfg.tile_h));
+  printf("  %-9s %-9d %-26s %s\n", "hmx", cfg.hmx,
+         cfg.hmx==1 ? "hardware limit" : "OVERRIDDEN (unreal)",
+         cfg.hmx==1 ? "convolutions are serial" : "more than the hardware has");
+  printf("  %-9s %-9d %-26s %s\n", "hvx", cfg.hvx, "SoC-dependent",
+         "slice and relu can share a slot");
+  printf("  %-9s %-9ld %-26s peak %ld KB, spill %ld KB\n", "vtcm", cfg.vtcm/1024,
+         "graph config option", peak/1024, spill/1024);
+  printf("  %-9s %-9d %-26s %d anti-deps, %+d slots\n", "prefetch", cfg.prefetch,
+         "df_dma_prefetch_distance", na, nslots-nfree);
+  printf("  %-9s %-9d %-26s %s\n", "align", cfg.align_big,
+         cfg.align_big==2048 ? "2 KB block" : "POLICY (vendor uses 256)", "offset granularity");
+  printf("  %-9s %-9d %-26s %d links\n", "inplace", cfg.inplace, "policy", nlinked_report);
+  printf("  %-9s %-9d %-26s %s\n", "antidep", cfg.antidep,
+         cfg.antidep ? "required for correctness" : "UNSAFE (ignores allocation)",
+         cfg.antidep ? "schedule respects allocation" : "schedule may corrupt data");
   return 0;
 }

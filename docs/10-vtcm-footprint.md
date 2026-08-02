@@ -108,11 +108,44 @@ multiple of 8 that stays under budget/2 while width 64 does not. But the same fa
 conservative for `scan_oc256`, where the vendor's width 24 would then exceed the limit. So the
 margin is not a single constant, and is left unmodelled.
 
-There is also a hint about the search itself. Both 1 MB cases reduce width by a factor of
-**6** — `ceil(256/6) → 48` and `ceil(128/6) → 24` after rounding up to a multiple of 8 — which is
-not a power of two. The open-source backend documents a power-of-two reduction factor, so either
-the production search differs, or the factor is arrived at by iteration. Reproducing it exactly
-is the next step; the halving search implemented here is a stand-in.
+### The width choice is not a function of per-op footprint
+
+Two hypotheses were tested against the data and both are dead.
+
+**A constant reduction factor.** The first two width-splitting cases both reduce width by 6
+(`ceil(256/6) → 48`, `ceil(128/6) → 24`), which looked like a rule. A third case found later in
+the measurement artefacts — a 112-channel convolution at 1 MB — reduces by **4** instead
+(`128 → 32`). Not a constant, and not a power of two either.
+
+**A constant margin.** If the vendor simply used a tighter limit, `footprint <= k * budget/2`
+for some `k < 1`, then across cases the largest accepted ratio would have to fall below the
+smallest rejected one. It does not:
+
+| case | vendor width | ratio to budget/2 | next width up | ratio |
+|---|---|---|---|---|
+| conv_huge | 48 | 0.43 | 96 | 0.71 |
+| scan_oc256 | 24 | **0.56** ← accepted | 48 | 0.82 |
+| fine_oc112 | 32 | 0.30 | 64 | **0.47** ← rejected |
+
+The accepted 0.56 exceeds the rejected 0.47, so **no single `k` exists**. In the third case the
+vendor split the width even though leaving it whole would have fit comfortably (0.47 of the
+limit, and the unsplit width fits at 0.80).
+
+So the per-op condition decides *whether* to split — 16/16 — but the width is set by something
+outside it. The likeliest candidate is the allocation retry loop: the vendor's allocation entry
+point is called twice and logs how many internal passes it ran, and its documented stage order
+places a re-scheduling pass *after* allocation. A tile that fits on its own can still fail once
+several are live at once for pipelining, and the retry would then come back with a smaller one.
+That would make width a whole-graph decision rather than a per-op one, which is consistent with
+everything above. Testing it requires modelling the retry loop, which is the next piece of work.
+
+### A note on one discarded experiment
+
+An earlier budget sweep over the same 112-channel convolution produced identical graphs at all
+four budgets, which would have looked like evidence that the budget does not drive splitting. It
+was an artefact: the configuration named a graph that did not exist, so it was silently ignored.
+The corrected run varies as expected (16 → 16 → 64 → 256 ops from 8 MB down to 1 MB). Only the
+corrected data is used here. A finer sweep places the first transition between 3 MB and 4 MB.
 
 ## Sources
 

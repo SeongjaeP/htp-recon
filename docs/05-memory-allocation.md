@@ -139,6 +139,21 @@ Both are lifetime-interval colouring; the vendor adds sweep-line event processin
 alignment, and iteration to convergence. So earlier spill mismatches between the two were never
 a bug on either side — they are two valid strategies with different constants.
 
+## Allocation constrains what can run in parallel
+
+Sharing an address is only safe under the order the allocator was shown. Once two tensors occupy
+the same bytes, the ops touching them can no longer be freely reordered — so allocation hands the
+next stage a set of **anti-dependencies**, and the vendor's documented stage order puts its
+parallelising pass after allocation for exactly this reason.
+
+`minicc` emits them (`record_anti_deps`) and measures the cost: 18–24 % fewer slots instead of
+the 60–67 % a scheduler would report if it ignored them. Details in
+[04-scheduling.md](04-scheduling.md).
+
+The trade-off is real and this allocator sits at one extreme of it: first-fit with maximum reuse
+minimises peak memory and maximises the constraints. An allocator that deliberately kept
+consecutive tiles apart would give memory back and buy parallelism.
+
 ## Not modelled
 
 - **The retry loop.** The vendor's allocator is invoked twice per stage and logs

@@ -140,14 +140,37 @@ for(each ready op i){
 The scheduler also emits a flattened sequential runlist alongside the 2-D slots, so the
 allocator downstream needs no changes.
 
-### Results
+### Results — and a correction
 
-| Graph | Sequential slots | Parallel slots | Reduction |
+The figures below were first measured with the parallel pass running *before* allocation. That
+is the wrong order, and it inflated them roughly threefold. Both columns are kept because the
+gap between them is the finding:
+
+| Graph | Sequential | Parallel, ignoring allocation | Parallel, as allocated |
 |---|---|---|---|
-| `branch_merge` (3 convs, all HMX) | 8 | 7 | 12.5 % |
-| tiled conv, H=16 (2 tiles) | 11 | 8 | 27.3 % |
-| tiled conv, H=64 (8 tiles) | 35 | 14 | **60.0 %** |
-| tiled conv, H=128 (16 tiles) | 67 | 22 | **67.2 %** |
+| tiled conv, H=16 (2 tiles) | 11 | 8 (27.3 %) | **9 (18.2 %)** |
+| tiled conv, H=32 (4 tiles) | 19 | 10 (47.4 %) | **15 (21.1 %)** |
+| tiled conv, H=64 (8 tiles) | 35 | 14 (60.0 %) | **27 (22.9 %)** |
+| tiled conv, H=128 (16 tiles) | 67 | 22 (67.2 %) | **51 (23.9 %)** |
+
+The middle column is what a scheduler sees if it ignores where the allocator put things. The
+right column is what can actually run. **The real reduction is 18–24 %, not 60–67 %**, and the
+difference grows with graph size: +1 slot at H=16, +29 at H=128.
+
+### Why the gap exists
+
+Allocation gives two tensors the same bytes when their lifetimes do not overlap — which is only
+true *under the order allocation was shown*. Reordering can break it. The vendor states the
+consequence directly: two ops that could have been rearranged in any order "can no longer be
+swapped, because doing so would cause some blocks of data that were allocated in an overlapping
+manner to be needed at the same time", and notes that the allocator tries to limit this "since
+these new restrictions can constrain available parallelism".
+
+`minicc` now emits those constraints as **anti-dependencies** and the final scheduler obeys them.
+They are numerous: 14 of them on an 11-op graph, 208 on a 67-op one.
+
+This is the phase-ordering problem from classical compilers — register allocation introducing
+false dependencies that constrain instruction scheduling — with tensors instead of registers.
 
 Raising the HVX worker count from 1 to 4 on a graph of four independent relus cut slots from 7
 to 4 (42.9 %). On `branch_merge` the same change did **nothing** — all three convolutions
@@ -158,18 +181,25 @@ contend for the single matrix engine.
 **The 12.5 % ceiling on `branch_merge` is hardware, not a code limitation.** With one matrix
 engine, three convolutions are necessarily serial.
 
-**Tiling creates parallelism, not just memory fit.** Tiled graphs parallelise far better
-(60–67 %) than the untiled one (12.5 %) because tiling spreads work across *different* engines:
-`SlicePad` on HVX, staging on DMA, `ConvLayer` on HMX. That produces a pipeline —
+**Tiling creates parallelism, not just memory fit** — but allocation can take it back. Tiled
+graphs still parallelise better than the untiled one (18–24 % against 12.5 %) because tiling
+spreads work across *different* engines: `SlicePad` on HVX, staging on DMA, `ConvLayer` on HMX.
+
+The most valuable overlap would be this one:
 
 ```
 t4 | conv0 (HMX) | -           | vtcm1 (DMA)   ← compute tile 0 while loading tile 1
 ```
 
-— which is the real source of the gain, and a second reason the vendor splits convolutions at
-all. Prefetching the next tile during the current computation is exactly the
-`df_dma_prefetch_distance` / double-buffering behaviour visible in the runtime's configuration
-namespace.
+**It does not survive allocation here.** Tile 1's staging buffer was given tile 0's address, so
+loading it early would corrupt data `conv0` is still reading. The load slips to the next slot and
+DMA sits idle during `conv0`.
+
+That is not a defect in the schedule — it is the allocator's doing, and it is avoidable. Holding
+the two tiles at *different* addresses would restore the overlap at the cost of memory. This is
+precisely what double buffering buys, and it is a plausible reason the vendor's own fit condition
+reserves half the budget (`<= TCM_SIZE/2`, see [10-vtcm-footprint.md](10-vtcm-footprint.md))
+rather than packing as tightly as this allocator does.
 
 ## Caveat
 

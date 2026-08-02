@@ -29,7 +29,8 @@ compiler's own output and against measurements on a physical device.
 | On-chip memory pressure costs performance | On-device latency sweep, VTCM 8 MB → 1 MB | **up to 2.97× slower**, monotonic |
 | Channel splitting is driven by memory budget | On-device: tiles per layer as budget shrinks | 16 → 768 tiles, reproduced |
 | Dequantisation is `(q − offset) × scale` | Instruction-level reading, then checked against a shipping quantised LLM | **6 / 6 parameters**; the public header's `(q + offset)` fails 0 / 6 |
-| Resource-aware parallel scheduling | Slot count vs. sequential baseline | **60–67 % fewer slots** |
+| Resource-aware parallel scheduling | Slot count vs. sequential baseline | **18–24 % fewer slots** |
+| Allocation costs parallelism | Slots before vs. after honouring the allocator's constraints | **+13 to +132 %** slots |
 | On-chip footprint decides when to split | Predicted split/no-split vs. vendor tile shapes, 4 graphs × 4 budgets | **16 / 16** |
 | …and which tile shape it picks | Same comparison, exact tile shape | **14 / 16** |
 
@@ -41,22 +42,25 @@ backwards**, and a shipping model's own quantisation parameters settle it.
 ## The pipeline
 
 ```
-                 ┌─────────────────────────────────────────────┐
-   Conv          │  ① Lowering      split into tiles + relu    │
-   [1,H,W,C]  ─► │  ② Scheduling    order ops across engines   │ ─►  execution plan
-                 │  ③ In-place link  mark overwritable outputs │     (op order +
-                 │  ④ Allocation    assign VTCM offsets        │      VTCM offsets)
-                 └─────────────────────────────────────────────┘
+                 ┌──────────────────────────────────────────────────────┐
+   Conv          │ ① Lowering        split into tiles + relu            │
+   [1,H,W,C]  ─► │ ② Pre-schedule    sequential order; fixes lifetimes  │ ─► execution plan
+                 │ ③ Allocation      in-place links, then VTCM offsets  │    (op order +
+                 │ ④ Anti-deps       constraints allocation just made   │     VTCM offsets)
+                 │ ⑤ Final schedule  parallelise, obeying ④             │
+                 └──────────────────────────────────────────────────────┘
 ```
 
-These four stages correspond one-to-one to four stages of the vendor compiler, identified by
-mapping its own stage timers to code addresses (see
+The order is the vendor's, not the obvious one, and it is documented: scheduling and allocation
+both happen inside graph preparation, and the pass that maximises parallelism runs **after**
+allocation because it "must obey the restrictions the allocator introduced by allocating some
+blocks at overlapping address ranges" (see
 [docs/02-compiler-pipeline.md](docs/02-compiler-pipeline.md)).
 
-### Why the order matters
+### Why scheduling comes first
 
-Scheduling must come before allocation, because **the schedule is what defines a tensor's
-lifetime**. Two tensors whose lifetimes do not overlap can share one address:
+**The schedule is what defines a tensor's lifetime.** Two tensors whose lifetimes do not overlap
+can share one address:
 
 ```
 Order A — finish tile 0, then tile 1        Order B — interleave both tiles
@@ -67,9 +71,17 @@ Order A — finish tile 0, then tile 1        Order B — interleave both tiles
   peak = 1 tile                               peak = 2 tiles
 ```
 
-Same graph, same dependencies, **half the memory**. Picking order A is the scheduler's job;
-noticing that tile 1 may reuse tile 0's address is the allocator's job. The two are one
-problem wearing two hats.
+Same graph, same dependencies, **half the memory**.
+
+### …and why parallelising comes last
+
+Order A let tile 1 reuse tile 0's address — but only *because* it runs strictly after. Once
+those two tensors share bytes, a later pass may no longer interleave them, or both would need
+the same memory at once. Allocation hands the scheduler a set of **anti-dependencies**, and they
+are not free: honouring them costs 13–132 % more slots here.
+
+This is the classic phase-ordering problem — register allocation creating false dependencies
+that constrain instruction scheduling — with tensors in place of registers.
 
 ---
 
@@ -88,15 +100,12 @@ model, which the scheduler then has to respect:
 Worker pools are split by engine (`"Started %d vec workers, %d matrix workers, %d eltwise
 workers"`), which is exactly why a per-resource scheduler is the right shape.
 
-**Consequence:** matrix ops are serial. Convolutions never overlap each other — the gain
-comes from overlapping a convolution with the DMA load of the *next* tile:
+**Consequence:** matrix ops are serial. Convolutions never overlap each other, so the gain has
+to come from overlapping a convolution with vector or DMA work.
 
-```
-slot  | HMX     | HVX                  | DMA
-t2    | -       | slicepad0,slicepad1  | -        ← two HVX workers in parallel
-t4    | conv0   | -                    | vtcm1    ← compute overlaps next tile's load
-t5    | conv1   | relu0                | -        ← conv0/conv1 in separate slots (HMX=1)
-```
+Whether the most valuable overlap — computing tile 0 while DMA loads tile 1 — actually survives
+depends on allocation. If both tiles were given the same bytes, it does not. See
+[docs/04](docs/04-scheduling.md).
 
 ---
 
@@ -104,7 +113,7 @@ t5    | conv1   | relu0                | -        ← conv0/conv1 in separate sl
 
 ```
 src/
-  minicc.c              the integrated mini compiler (stages ①–④)
+  minicc.c              the integrated mini compiler (stages ①–⑤)
   lowering.c            tile-count rule in isolation
   vtcm_tiling.c         tile shape derived from an on-chip memory budget
   scheduler.c           topological (Kahn) scheduling, three tie-break policies
@@ -132,22 +141,32 @@ Sample output — `./build/minicc 2097152 16 64 32` (vtcm_bytes, H, W, out_chann
 ```
 (1) Lowering: 1 high-level Conv -> 11 low-level ops (tiles = ceil(16/8) = 2)
 
-(2) Schedule (parallel; HMX=1 HVX=4 DMA=1): time x resource
-    slot  | HMX            | HVX                        | DMA
-    ------+----------------+----------------------------+------------
-    t2    | -              | cv_slicepad0,cv_slicepad1  | -
-    t4    | cv_conv0       | -                          | cv_vtcm1
-    t5    | cv_conv1       | cv_relu0                   | -
-    -> 11 sequential slots -> 8 parallel slots (27.3% fewer)
+(2) Pre-schedule (sequential, memory-cost order): 11 ops
    [in-place links: 2]
 
 (3) Allocation (VTCM 2048 KB, first-fit + lifetime reuse):
     11 tensors, 488 KB total -> 170 KB peak (318 KB saved by reuse), 0 KB spill
+
+(4) Anti-dependencies created by allocation: 14
+
+(5) Final schedule (parallel; HMX=1 HVX=4 DMA=1): time x resource
+    slot  | HMX            | HVX                        | DMA
+    ------+----------------+----------------------------+------------
+    t2    | -              | cv_slicepad0,cv_slicepad1  | -
+    t4    | cv_conv0       | -                          | -
+    t5    | -              | cv_relu0                   | cv_vtcm1
+    sequential             : 11 slots
+    parallel, unconstrained:  8 slots  (27.3% fewer)
+    parallel, as allocated :  9 slots  (18.2% fewer)   <- 1 slot given back
 ```
 
-Three rows of the schedule are worth reading closely: `t2` runs two slice ops at once because
-the vector engine has several workers; `t4` computes tile 0 while DMA loads tile 1; and
-`cv_conv0`/`cv_conv1` land in *different* slots because there is only one matrix engine.
+Read `t2`, `t4` and `t5` together. `t2` runs two slice ops at once because the vector engine has
+several workers. `t4` computes tile 0 — but **DMA sits idle**, because loading tile 1 into the
+bytes tile 0 is still using would corrupt it. That load only happens at `t5`.
+
+That idle slot is the price of allocation, and it is exactly what the last line counts. Running
+the parallel pass *before* allocation would have reported 8 slots and an overlap that cannot
+actually happen.
 
 Other entry points:
 
@@ -190,9 +209,10 @@ Honest gaps, all observed but not implemented:
   Here relu is a separate op that reuses its input's memory instead.
 - **Cost-weighted slots.** A slot here is a logical parallel step, not a duration. Op cycle
   counts are not modelled, so slot reduction is not a latency prediction.
-- **Parallelism vs. memory trade-off.** More parallelism means more tensors alive at once,
-  which increases memory pressure. The vendor runs its parallelisation stage *after*
-  allocation for this reason; the two are not co-optimised here.
+- **Co-optimising parallelism and memory.** The trade-off is now *measured* — allocation's
+  constraints cost 13–132 % more slots (see [docs/04](docs/04-scheduling.md)) — but not
+  optimised. A allocator that deliberately left tiles unshared would buy the parallelism back;
+  this one packs tightly and pays for it.
 - **How far the tile search goes.** The footprint condition (see
   [docs/10](docs/10-vtcm-footprint.md)) correctly predicts *whether* a tile must be split, but
   the vendor picks a smaller tile than the condition requires. The extra conservative margin —

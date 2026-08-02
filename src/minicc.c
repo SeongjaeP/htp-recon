@@ -1,15 +1,20 @@
 // minicc.c — a mini NPU compiler, end to end
 //
-//   high-level graph -> [lowering] -> [scheduling] -> [VTCM allocation] -> execution plan
+//   graph -> [lowering] -> [pre-schedule] -> [allocation] -> [final parallel schedule]
 //
-// This reproduces the four stages the vendor's closed compiler runs, each derived from a
-// different source of evidence:
+// The stage ORDER matters and is not the obvious one. The vendor documents it: scheduling and
+// allocation both happen inside graph preparation, and the pass that maximises parallelism runs
+// AFTER allocation, because it "must obey the restrictions the allocator introduced by
+// allocating some blocks at overlapping address ranges".
 //
-//   lowering    observed 19-op expansion of a 6-op graph, plus the vendor's open-source MLIR
-//               backend, which fixes tile height at 8 (the 2 KB "crouton" block shape)
-//   scheduling  the closed library's own diagnostic strings name a cost-based scheduler with a
-//               greedy pass and a DP fallback; here: topological order with per-resource slots
-//   allocation  tensor lifetimes derived from the schedule, in-place linking, first-fit offsets
+//   lowering        observed 19-op expansion of a 6-op graph, plus the vendor's open-source
+//                   MLIR backend, which fixes tile height at 8 (the 2 KB block shape)
+//   pre-schedule    a sequential order that keeps on-chip pressure low; this is what fixes
+//                   every tensor's lifetime, so allocation depends on it
+//   allocation      lifetimes -> in-place linking -> first-fit offsets, and as a side effect,
+//                   ordering constraints wherever two tensors were given the same bytes
+//   final schedule  parallelise across engines, respecting both real dependencies and the
+//                   constraints allocation created
 //
 // See docs/03-tiling-and-crouton.md, docs/04-scheduling.md, docs/05-memory-allocation.md.
 #define _POSIX_C_SOURCE 200809L
@@ -51,6 +56,31 @@ static Node g[MAXN]; static int N=0;
 
 typedef struct { char name[MAXNAME]; long size; } Ten;
 static Ten ten[MAXTEN]; static int NT=0;
+
+// ── Anti-dependencies: ordering constraints that ALLOCATION creates ──
+//
+// The vendor's documentation is explicit about this. When two blocks are given overlapping
+// address ranges — legal, because their lifetimes were disjoint under the schedule that was
+// current at allocation time — then "two ops that could have been rearranged in any order can
+// no longer be swapped, because doing so would cause some blocks of data that were allocated in
+// an overlapping manner to be needed at the same time". It adds that the allocator tries to
+// limit this, "since these new restrictions can constrain available parallelism".
+//
+// This is the classic phase-ordering problem: register allocation introduces false dependencies
+// that constrain instruction scheduling. Tensors instead of registers, but the same shape.
+//
+// An edge u -> v means "u must complete before v starts", over and above the real data
+// dependencies. It is why the final scheduler has to run AFTER allocation and obey its output.
+#define MAXANTI 16384
+static int anti_u[MAXANTI], anti_v[MAXANTI];
+static int n_anti = 0;
+
+static void add_anti(int u, int v) {
+  if (u < 0 || v < 0 || u == v || n_anti >= MAXANTI) return;
+  for (int d = 0; d < g[v].ndep; d++) if (g[v].deps[d] == u) return;   // already a real dep
+  for (int k = 0; k < n_anti; k++) if (anti_u[k]==u && anti_v[k]==v) return;
+  anti_u[n_anti] = u; anti_v[n_anti] = v; n_anti++;
+}
 
 static long ceil_div(long a,long b){ return (a+b-1)/b; }
 static long align_size(long n){ long a=(n>=ALIGN_LARGE)?ALIGN_LARGE:ALIGN_SMALL; return (n+a-1)&~(a-1); }
@@ -195,7 +225,10 @@ static void schedule_cbs(int* rl,int* rn){
 //   rl[]          = the same schedule flattened into a sequence, which the allocator consumes
 static void schedule_par(int slot[][R_NUM][MAXCAP], int* nslots, int* rl, int* rn) {
   int indeg[MAXN];
+  // Real data dependencies plus whatever ordering the allocator imposed. With n_anti == 0 this
+  // is the ordinary parallel schedule; after allocation it is the constrained one.
   for (int i = 0; i < N; i++) { indeg[i] = g[i].indeg; g[i].scheduled = 0; }
+  for (int k = 0; k < n_anti; k++) indeg[anti_v[k]]++;
   *rn = 0;
   int t = 0;
   for (;; t++) {
@@ -223,11 +256,12 @@ static void schedule_par(int slot[][R_NUM][MAXCAP], int* nslots, int* rl, int* r
       rl[(*rn)++] = b;
     }
 
-    // Release successors of everything picked this slot.
+    // Release successors of everything picked this slot, along both edge kinds.
     for (int r = 0; r < R_NUM; r++) for (int k = 0; k < nfilled[r]; k++) {
       int b = picked[r][k];
       for (int i = 0; i < N; i++) for (int d = 0; d < g[i].ndep; d++)
         if (g[i].deps[d] == b) indeg[i]--;
+      for (int e = 0; e < n_anti; e++) if (anti_u[e] == b) indeg[anti_v[e]]--;
     }
   }
   *nslots = t;
@@ -325,6 +359,41 @@ static void alloc_vtcm(int* rl,int rn,long vtcm,long* peak_o,long* spill_o){
   *peak_o=peak; *spill_o=spill;
 }
 
+// ── Stage 5: read the ordering constraints allocation just created ──
+//
+// Two tensors were given overlapping addresses because their lifetimes did not overlap under
+// the schedule allocation saw. That is only safe while that ordering holds. If the later
+// tensor were produced before the earlier one is finished with, both would need the same bytes
+// at once.
+//
+// So for every overlapping pair, the op that last consumes the earlier tensor must complete
+// before the op that produces the later one. rl[] maps a schedule position back to its node,
+// which is how a lifetime endpoint becomes an op.
+//
+// In-place aliases are skipped: they share an address deliberately, and the real data
+// dependency between them already enforces the order.
+static int addr_overlap(int a, int b) {
+  long ae = L[a].offset + L[a].size, be = L[b].offset + L[b].size;
+  return !(ae <= L[b].offset || be <= L[a].offset);
+}
+
+static int record_anti_deps(int* rl, int rn) {
+  n_anti = 0;
+  for (int i = 0; i < nL; i++) {
+    for (int j = i + 1; j < nL; j++) {
+      if (L[i].offset < 0 || L[j].offset < 0) continue;
+      if (L[i].alias_of == j || L[j].alias_of == i) continue;   // same buffer on purpose
+      if (overlaps(i, j)) continue;                             // lifetimes clash: not sharing
+      if (!addr_overlap(i, j)) continue;                        // disjoint addresses: no constraint
+      int e = (L[i].death <= L[j].birth) ? i : j;               // earlier / later by lifetime
+      int l = (e == i) ? j : i;
+      if (L[e].death >= rn || L[l].birth >= rn) continue;
+      add_anti(rl[L[e].death], rl[L[l].birth]);
+    }
+  }
+  return n_anti;
+}
+
 int main(int argc,char**argv){
   long vtcm = (argc>1)? atol(argv[1]) : (2L*1024*1024);
   int H = (argc>2)? atoi(argv[2]) : 64;
@@ -342,14 +411,41 @@ int main(int argc,char**argv){
          N, H, ceil_div(H,TILE_H));
   for(int i=0;i<N;i++) printf("    %-16s %s\n", g[i].name, g[i].type);
 
-  // Stage 2 — scheduling
+  // Stage 2 — pre-schedule. A sequential order is what allocation will see, and it is what
+  // fixes every tensor's lifetime. The vendor calls this the pre-scheduler; its job is an order
+  // that keeps on-chip pressure low, so the cost-based pass is the right one here.
   build_dag();
-  static int slot[MAXN][R_NUM][MAXCAP];
-  for(int t=0;t<MAXN;t++) for(int r=0;r<R_NUM;r++) for(int k=0;k<MAXCAP;k++) slot[t][r][k]=-1;
-  int rl[MAXN],rn,nslots;
-  schedule_par(slot,&nslots,rl,&rn);
+  int rl[MAXN], rn;
+  schedule_cbs(rl, &rn);
+  printf("\n(2) Pre-schedule (sequential, memory-cost order): %d ops\n", rn);
 
-  printf("\n(2) Schedule (parallel; HMX=%d HVX=%d DMA=%d): time x resource\n",
+  // Stage 3 — allocation, on that order
+  long peak, spill;
+  alloc_vtcm(rl, rn, vtcm, &peak, &spill);
+  printf("\n(3) Allocation (VTCM %ld KB, first-fit + lifetime reuse):\n", vtcm/1024);
+  long total=0; for(int i=0;i<nL;i++) total+=L[i].size;
+  printf("    %d tensors, %ld KB total -> %ld KB peak (%ld KB saved by reuse), %ld KB spill\n",
+         nL, total/1024, peak/1024, (total-peak)/1024, spill/1024);
+
+  // Stage 4 — read back the ordering constraints that allocation just created
+  int na = record_anti_deps(rl, rn);
+  printf("\n(4) Anti-dependencies created by allocation: %d\n", na);
+
+  // Stage 5 — final parallel re-schedule, obeying them.
+  // Run it twice to price the constraints: once ignoring them (which is what parallelising
+  // BEFORE allocation would have produced) and once respecting them.
+  static int slot[MAXN][R_NUM][MAXCAP];
+  int rl2[MAXN], rn2, nfree;
+  int keep = n_anti; n_anti = 0;
+  for(int t=0;t<MAXN;t++) for(int r=0;r<R_NUM;r++) for(int k=0;k<MAXCAP;k++) slot[t][r][k]=-1;
+  schedule_par(slot, &nfree, rl2, &rn2);
+  n_anti = keep;
+
+  int nslots;
+  for(int t=0;t<MAXN;t++) for(int r=0;r<R_NUM;r++) for(int k=0;k<MAXCAP;k++) slot[t][r][k]=-1;
+  schedule_par(slot, &nslots, rl2, &rn2);
+
+  printf("\n(5) Final schedule (parallel; HMX=%d HVX=%d DMA=%d): time x resource\n",
          CAP[R_HMX],CAP[R_HVX],CAP[R_DMA]);
   printf("    %-5s | %-26s| %-26s| %s\n","slot",RNAME[0],RNAME[1],RNAME[2]);
   printf("    ------+---------------------------+---------------------------+---------------------------\n");
@@ -367,17 +463,12 @@ int main(int argc,char**argv){
     }
     printf("\n");
   }
-  printf("    -> %d sequential slots -> %d parallel slots (%.1f%% fewer)\n",
-         N, nslots, 100.0*(N-nslots)/N);
+  printf("    sequential            : %d slots\n", N);
+  printf("    parallel, unconstrained: %d slots  (%.1f%% fewer)\n",
+         nfree, 100.0*(N-nfree)/N);
+  printf("    parallel, as allocated : %d slots  (%.1f%% fewer)"
+         "   <- %d slots given back to allocation\n",
+         nslots, 100.0*(N-nslots)/N, nslots-nfree);
 
-  // Stages 3 and 4 — in-place linking, then allocation
-  long peak,spill; alloc_vtcm(rl,rn,vtcm,&peak,&spill);
-  printf("\n(3) Allocation (VTCM %ld KB, first-fit + lifetime reuse):\n", vtcm/1024);
-  long total=0; for(int i=0;i<nL;i++) total+=L[i].size;
-  printf("    %d tensors, %ld KB total -> %ld KB peak (%ld KB saved by reuse), %ld KB spill\n",
-         nL, total/1024, peak/1024, (total-peak)/1024, spill/1024);
-
-  printf("\n===== execution plan: %d ops, order fixed, every tensor given a VTCM offset =====\n", N);
-  (void)schedule_cbs;   // available for comparison; see scheduler_cbs.c
   return 0;
 }

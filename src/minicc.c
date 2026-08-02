@@ -268,7 +268,10 @@ static void schedule_par(int slot[][R_NUM][MAXCAP], int* nslots, int* rl, int* r
 }
 
 // ── Stages 3 and 4: in-place linking, then VTCM allocation ──
-typedef struct{char name[MAXNAME];long size;int birth,death;long offset;
+// death is what the allocator tests for overlap; it may be padded to force double buffering.
+// last_use is the true final read, which is where the hazard actually is — anti-dependencies
+// must use that one, or padding a lifetime would push its constraint later and tighten it.
+typedef struct{char name[MAXNAME];long size;int birth,death,last_use;long offset;
                int alias_of;} Live;   // alias_of = tensor sharing this address (-1 = independent)
 static Live L[MAXTEN]; static int nL=0;
 // The entire safety condition for sharing an address: lifetimes must not overlap.
@@ -315,6 +318,14 @@ static int link_inplace(int* pos) {
   return linked;
 }
 
+// Prefetch distance, in schedule steps. 0 packs as tightly as possible; 1 keeps each tensor
+// nominally live one step past its last read, so the next tensor cannot take its address.
+//
+// That is double buffering, expressed as an allocator policy rather than a scheduler one. The
+// runtime exposes the same idea as df_dma_prefetch_distance: issue the load N steps ahead, which
+// is only safe if N+1 buffers exist to hold the results.
+static int PREFETCH = 0;
+
 static void alloc_vtcm(int* rl,int rn,long vtcm,long* peak_o,long* spill_o){
   int pos[MAXN]; for(int s=0;s<rn;s++) pos[rl[s]]=s;
   nL=0;
@@ -324,11 +335,29 @@ static void alloc_vtcm(int* rl,int rn,long vtcm,long* peak_o,long* spill_o){
     int birth=pos[j],death=birth;
     for(int c=0;c<N;c++)for(int m=0;m<g[c].nin;m++)if(strcmp(g[c].ins[m],tn)==0&&pos[c]>death)death=pos[c];
     strncpy(L[nL].name,tn,MAXNAME-1); L[nL].size=sz; L[nL].birth=birth; L[nL].death=death;
-    L[nL].offset=-1; L[nL].alias_of=-1; nL++;
+    L[nL].last_use=death; L[nL].offset=-1; L[nL].alias_of=-1; nL++;
   }
 
   int nlinked = link_inplace(pos);
   if(nlinked) printf("   [in-place links: %d]\n", nlinked);
+
+  // Double buffering: hold the DMA-staged tensors past their last read, so the next tile's
+  // staging buffer cannot take the address the current one is still being read from.
+  //
+  // Only the staged buffers are extended, not every tensor. Those are the ones being pipelined —
+  // extending everything costs peak memory across the whole graph and buys nothing for the
+  // compute/transfer overlap. Applied AFTER in-place linking, which needs the exact last-use
+  // step to decide whether overwriting is legal.
+  if(PREFETCH > 0)
+    for(int i=0;i<nL;i++){
+      int prod = -1;
+      for(int j=0;j<N && prod<0;j++)
+        for(int k=0;k<g[j].nout;k++)
+          if(strcmp(g[j].outs[k], L[i].name)==0){ prod=j; break; }
+      if(prod < 0 || g[prod].res != R_DMA) continue;   // staged buffers only
+      L[i].death += PREFETCH;
+      if(L[i].death > rn-1) L[i].death = rn-1;
+    }
 
   // Place in birth order, so the already-placed tensors are exactly those that could conflict.
   int order[MAXTEN]; for(int i=0;i<nL;i++)order[i]=i;
@@ -385,10 +414,10 @@ static int record_anti_deps(int* rl, int rn) {
       if (L[i].alias_of == j || L[j].alias_of == i) continue;   // same buffer on purpose
       if (overlaps(i, j)) continue;                             // lifetimes clash: not sharing
       if (!addr_overlap(i, j)) continue;                        // disjoint addresses: no constraint
-      int e = (L[i].death <= L[j].birth) ? i : j;               // earlier / later by lifetime
+      int e = (L[i].last_use <= L[j].birth) ? i : j;            // earlier / later by lifetime
       int l = (e == i) ? j : i;
-      if (L[e].death >= rn || L[l].birth >= rn) continue;
-      add_anti(rl[L[e].death], rl[L[l].birth]);
+      if (L[e].last_use >= rn || L[l].birth >= rn) continue;
+      add_anti(rl[L[e].last_use], rl[L[l].birth]);
     }
   }
   return n_anti;
@@ -399,6 +428,7 @@ int main(int argc,char**argv){
   int H = (argc>2)? atoi(argv[2]) : 64;
   int W = (argc>3)? atoi(argv[3]) : 64;
   int OC= (argc>4)? atoi(argv[4]) : 32;
+  PREFETCH = (argc>5)? atoi(argv[5]) : 0;   // 0 = pack tightly, 1 = double buffer
 
   printf("========= mini HTP compiler =========\n");
   printf("input high-level graph: Conv [1,%d,%d,%d] (Cin=%d), fp16\n\n", H,W,OC,OC);

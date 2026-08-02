@@ -31,6 +31,7 @@ compiler's own output and against measurements on a physical device.
 | Dequantisation is `(q − offset) × scale` | Instruction-level reading, then checked against a shipping quantised LLM | **6 / 6 parameters**; the public header's `(q + offset)` fails 0 / 6 |
 | Resource-aware parallel scheduling | Slot count vs. sequential baseline | **18–24 % fewer slots** |
 | Allocation costs parallelism | Slots before vs. after honouring the allocator's constraints | **+13 to +132 %** slots |
+| Double buffering buys it back | Prefetch distance 2 vs. tight packing, H=128 | **29 % fewer slots** for **+5 %** memory |
 | On-chip footprint decides when to split | Predicted split/no-split vs. vendor tile shapes, 4 graphs × 4 budgets | **16 / 16** |
 | …and which tile shape it picks | Same comparison, exact tile shape | **14 / 16** |
 

@@ -201,6 +201,47 @@ precisely what double buffering buys, and it is a plausible reason the vendor's 
 reserves half the budget (`<= TCM_SIZE/2`, see [10-vtcm-footprint.md](10-vtcm-footprint.md))
 rather than packing as tightly as this allocator does.
 
+## Buying the overlap back: double buffering
+
+The lost overlap is not inevitable. It exists because tile 1's staging buffer was given tile 0's
+address; hold them apart and the overlap returns.
+
+`minicc` exposes this as a prefetch distance (5th argument), which pads how long a DMA-staged
+tensor counts as live. The allocator then cannot hand its address to the next tile, so the load
+can be issued while the previous convolution is still running. This is the allocator-side
+expression of `df_dma_prefetch_distance` in the runtime's configuration namespace: issuing a load
+N steps early is only safe if N+1 buffers exist to receive it.
+
+| Graph | distance | anti-deps | slots | peak | vs. tight packing |
+|---|---|---|---|---|---|
+| H=64 | 0 | 96 | 27 | 554 KB | — |
+| H=64 | **2** | 78 | **20** | 606 KB | **26 % fewer slots, +9 % memory** |
+| H=64 | 3 | 76 | 18 | 800 KB | 33 % fewer slots, +44 % memory |
+| H=128 | 0 | 208 | 51 | 1066 KB | — |
+| H=128 | **2** | 234 | **36** | 1118 KB | **29 % fewer slots, +5 % memory** |
+| H=128 | 3 | 197 | 32 | 1568 KB | 37 % fewer slots, +47 % memory |
+
+Distance 2 is the useful setting, and the reason is visible in the sequential order: between a
+tile's convolution and the next tile's staging load sit two steps (`relu`, `slicepad`), so a
+padding of 2 is what makes the two buffers' lifetimes overlap. Distance 1 is not enough — the
+buffers still land on the same address, and the constraint survives. Distance 3 keeps buying
+slots but the cost turns over sharply.
+
+The relative memory cost *falls* as graphs grow (25 % at H=16, 9 % at H=64, 5 % at H=128),
+because one extra buffer is a fixed price spread over more tiles. Double buffering gets cheaper
+the more there is to pipeline.
+
+Two implementation notes, both learned the hard way:
+
+**Pad only what is pipelined.** Padding every tensor's lifetime costs 40–47 % peak memory and
+buys nothing, because most tensors are not on the transfer/compute boundary. Only DMA-staged
+buffers are padded here.
+
+**Anti-dependencies must use the true last read, not the padded lifetime.** Using the padded one
+pushes each constraint later in the schedule, making it *stricter* — padding then made the
+schedule worse rather than better. `Live` carries both `death` (padded, for the allocator's
+overlap test) and `last_use` (true, for the hazard).
+
 ## Caveat
 
 A slot is a **logical parallel step, not a duration**. Op cycle counts are not modelled, so
